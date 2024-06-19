@@ -1,0 +1,1542 @@
+---
+title: "Parameter Derivation and Analysis"
+output: html_document
+date: '2023-02-16'
+author: Haley Capone
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, echo = TRUE)
+ # will automatically include code in the ouput unless we state otherwise
+knitr::opts_chunk$set(warning= FALSE) # will NOT include warning messages in the output unless we state otherwise
+# knitr::opts_chunk$set(tidy.opts=list(width.cutoff=60),tidy=TRUE) #keeps code wrapped in the output
+# if you haven't installed these packages run the following line (first delete the # sign):
+
+#install.packages(c("tidyverse", "janitor", "kableExtra", "cowplot", "skimr", "measurements"))
+library(tidyverse) #data wrangling & cleaning incl. ggplot
+library(janitor) # more data cleaning functions
+library(kableExtra) # making pretty tables
+library(cowplot) # making publication quality figures or multi-panel figures
+library(skimr) # tool to get quick overview of dataset
+library(measurements) # useful to convert units
+library(magrittr) # magrittr::
+library(boot)
+library(mime)
+library(checkmate)
+library(curl)
+library(nls.multstart)
+library(broom) #augment
+library(boot)
+library(nlstools)
+library(proto)
+library(nls2)
+library(here)
+library(lme4)
+library(Matrix)
+library(lmerTest)
+library(stats)
+library(Rmisc)
+library(purrr) #map
+library(Hmisc)
+library(FSA)
+library(rcompanion)
+library(car)
+library(multcompView)
+library(lsmeans)
+library(sjstats)
+library(pwr)
+library(jtools)
+library(ggpubr)
+library(multcomp)
+library(sjPlot)
+library(sjlabelled)
+library(sjmisc)
+library(ggeffects)
+library(wesanderson)
+library(patchwork)
+library(dplyr)
+```
+
+```{r}
+# Raw Data {.tabset}
+#Data consists of metabolic rates for each individuals Net Photosynthesis, Dark Respiration, and Net Photosynthesis
+#r read in raw data from DataManipulation.R
+
+setwd("~/Desktop/Macro_phys_TP")
+
+
+mydata<-read.csv('Output/Photo.RNPP.csv')
+
+mydata$X<-NULL
+
+View(mydata)
+```
+
+
+#######Deriving thermal performance parameters from the SS-model equation######
+
+# define the Sharpe-Schoolfield equation
+```{r}
+schoolfield_high <- function(lnc, E, Eh, Th, temp, Tc) {
+  Tc <- 273.15 + Tc
+  k <- 8.62e-5
+  boltzmann.term <- lnc + log(exp(E/k*(1/Tc - 1/temp))) #units are eV/K, electrovolts/Kelvin
+  inactivation.term <- log(1/(1 + exp(Eh/k*(1/Th - 1/temp))))
+  return(boltzmann.term + inactivation.term)
+}
+```
+
+# fit over each set of groupings, this takes 2-3 mins to run
+```{r}
+mydata$rate.type<-as.character(mydata$rate.type)
+mydata$individual.ID<-as.character(mydata$individual.ID)
+
+fits <- mydata %>%
+  group_by(., rate.type, individual.ID) %>%
+  nest() %>%
+  mutate(fit = purrr::map(data, ~ nls_multstart(log.rate ~ schoolfield_high(lnc, E, Eh, Th, temp = K, Tc = 20.2),
+                                                data = .x,
+                                                iter = 1000,
+                                                start_lower = c(lnc = -10, E = 0.1, Eh = 0.2, Th = 285),
+                                                start_upper = c(lnc = 10, E = 2, Eh = 5, Th = 330),
+                                                supp_errors = 'Y',
+                                                na.action = na.omit,
+                                                lower = c(lnc = -10, E = 0, Eh = 0, Th = 0))))
+```
+
+```{r}
+# look at a single fit
+summary(fits$fit[[1]])
+
+# Select specific columns from the fits object
+selected_fits <- fits[c("individual.ID", "data", "fit")]
+
+# Get summary info
+info <- fits %>%
+  unnest_legacy(fit %>% map(glance))
+
+# Get params
+params <- fits %>%
+  unnest_legacy(fit %>% map(tidy))
+```
+
+#left join params with metadata file to have treatment in data frame
+```{r}
+metadata <- read.csv(file="../Macro_phys_TP/Output_analysis/Photo.RNPP.csv", header=T) #read in metadata file to add site block and recovery block 
+
+params <- left_join(params, metadata, by = "individual.ID")
+
+View(params)
+write.csv(params, "../Macro_phys_TP/Output_analysis/combined_TPC_term_estimates.csv")
+```
+
+# get confidence intervals
+```{r}
+CI <- fits %>%
+  unnest_legacy(fit %>% map(~ confint2(.x) %>%
+                       data.frame() #%>%
+                      # rename(., conf.low = X2.5.., conf.high = X97.5..)
+                     )) %>%
+  group_by(., individual.ID) %>%
+  mutate(., term = c('lnc', 'E', 'Eh', 'Th')) %>%
+  ungroup()
+```
+
+```{r}
+colnames(CI)[4:5]<-c("conf.low", "conf.high") # rename columns
+
+# merge parameters and CI estimates
+params <- merge(params, CI, by = intersect(names(params), names(CI)))
+
+# get predictions
+preds <- fits %>%
+  unnest_legacy(fit %>% map(augment))
+
+# #select(info, fragment.ID, logLik, AIC, BIC, deviance, df.residual)
+
+# new data frame of predictions, do this to set a sequence to make a smooth curve with your prediction points
+ new_preds <- mydata %>%  do(., data.frame(K = seq(min(.$K), max(.$K), length.out = 150), stringsAsFactors = FALSE)) #setting a specific sequence so you can have a smooth curve
+
+```
+
+# max and min for each curve
+```{r}
+max_min <- mydata %>% group_by(individual.ID) %>%
+  dplyr::summarise(., min_K = min(K), max_K = max(K)) %>%
+  ungroup()
+```
+
+# create new predictions
+```{r}
+preds2 <- fits %>%
+  unnest_legacy(fit %>% map(augment, newdata = new_preds)) %>%
+  merge(., max_min, by = "individual.ID") %>%
+  group_by(., individual.ID) %>%
+  filter(., K > unique(min_K) & K < unique(max_K)) %>%
+  dplyr::rename(., ln.rate = .fitted) %>%
+  ungroup()
+```
+
+```{r}
+#left join preds2 with meta data file to have treatment on dataframe
+ preds2 <- left_join(preds2, metadata, by = "individual.ID")
+View(preds2)
+
+#write.csv(preds2, "../Macro_phys_TP/Output_analysis/preds2.csv")
+
+preds2 <-read.csv(file="../Macro_phys_TP/Output_analysis/preds2.csv", header=T)
+View(preds2)
+```
+
+#want to do ggplot where we look at individual curves for respiration rates of each fragment
+```{r}
+mydataR <- mydata %>%
+  filter(rate.type =="Respiration")
+
+preds2R <- preds2 %>%
+  filter(rate.type =="Respiration")
+
+my_colors <- c('red4', 'pink')
+
+ ggplot() +
+   geom_point(data = mydataR, aes(K - 273.15, log.rate, col = interaction(rate.type, Ambient_Nutrient)), size = 2) +
+   geom_line(data = preds2R, aes(K - 273.15, ln.rate, col = interaction(rate.type, Ambient_Nutrient), group = individual.ID), alpha = 0.5) +
+   facet_wrap(~ individual.ID, labeller = labeller(.multi_line = FALSE)) +
+   scale_colour_manual(values = my_colors,
+                       labels = c('Ambient Respiration', 'Enriched Respiration')) +
+   theme_bw(base_size = 12, base_family = 'Helvetica') +
+   ylab(expression("Log " *mu*"mol (" *cm^-2 *hr^-1*")")) +
+   xlab('Temperature (ºC)') +
+   geom_hline(yintercept=0, color = "red1") +
+   theme(legend.position = c(0.91, 0.85))+
+   labs(color = "Rate Type & Treatment")  +
+   theme(panel.grid.major = element_blank(),
+         panel.grid.minor = element_blank(),
+         panel.background = element_blank(),
+         axis.line = element_line(colour = "black"))
+
+ ggsave(filename = "../Macro_phys_TP/Output_analysis/resp_individual_curves.pdf", device = "pdf", width = 10, height = 10)
+
+```
+
+#want to do ggplot where we look at individual curves for photosynthesis rates of each fragment
+```{r}
+mydataNP <- mydata %>%
+   filter(rate.type =="Net Photosynthesis")
+preds2NP <- preds2 %>%
+   filter(rate.type =="Net Photosynthesis")
+
+ my_colors <- c('green4', 'green')
+
+ ggplot() +
+   geom_point(data = mydataNP, aes(K - 273.15, log.rate, col = interaction(rate.type, Ambient_Nutrient)), size = 2) +
+   geom_line(data = preds2NP, aes(K - 273.15, ln.rate, col = interaction(rate.type, Ambient_Nutrient), group = individual.ID), alpha = 0.5) +
+   facet_wrap(~ individual.ID, labeller = labeller(.multi_line = FALSE)) +
+   scale_colour_manual(values = my_colors,
+                       labels = c('Ambient Net Photosynthesis', 'Enriched Net Photosynthesis')) +
+   theme_bw(base_size = 12, base_family = 'Helvetica') +
+   ylab(expression("Log " *mu*"mol (" *cm^-2 *hr^-1*")")) +
+   xlab('Temperature (ºC)') +
+   geom_hline(yintercept=0, color = "red1") +
+   theme(legend.position = c(0.91, 0.85))+
+   labs(color = "Rate Type & Treatment")  +
+   theme(panel.grid.major = element_blank(),
+         panel.grid.minor = element_blank(),
+         panel.background = element_blank(),
+         axis.line = element_line(colour = "black"))
+#
+
+ggsave(filename = "../Macro_phys_TP/Output_analysis/photo_individual_curves.pdf", device = "pdf", width = 10, height = 10)
+```
+
+```{r}
+#change ambient and nutrient names
+preds2 <- preds2 %>%
+   mutate(Ambient_Nutrient = recode_factor(Ambient_Nutrient, `Ambient` = "Ambient", `Nutrient` = "Nutrient"))
+```
+
+# Calculating the Topt parameter
+```{r}
+get_topt <- function(E, Th, Eh){
+  return((Eh*Th)/(Eh + (8.62e-05 *Th*log((Eh/E) - 1))))
+}
+
+# Synthesizing data from all  temperatures into one. I am summarizing (mean) all the rows for each taxa. The mean of 10-12 values that are the same as the value (ie duplicates) 
+params_short <- params %>%
+  dplyr::select(individual.ID, rate.type, Ambient_Nutrient, Species, term, estimate) %>%
+  dplyr::group_by(individual.ID, rate.type, Ambient_Nutrient, Species, term) %>%
+  dplyr::summarise(estimate = mean(estimate))
+
+View(params_short)
+
+#Nyssa's code for topt using the summarize of each  
+Topt_data <- params_short %>%
+  dplyr::select(individual.ID, rate.type, Ambient_Nutrient, Species, term, estimate) %>%
+  spread(term, estimate) %>%
+  mutate(Topt = get_topt(E, Th, Eh)) %>%
+  group_by(., individual.ID, rate.type, Ambient_Nutrient, Species)
+
+View(Topt_data)
+
+#Converting Topt to celsius 
+Topt_data$Topt <- Topt_data$Topt - 273.15 
+View(Topt_data)
+
+write.csv(Topt_data, "Topt_param.csv")
+
+#Parameter summary
+Topt_summarise<-Topt_data %>%
+  group_by(., Species, rate.type, Ambient_Nutrient) %>%
+  summarise_all(mean, na.rm=TRUE)
+
+
+View(Topt_summarise)
+
+#write.csv(Topt_summarise, "summary_parameters.csv")
+```
+
+```{r}
+#Derive Pmax parameter
+Pmax<- Topt_data %>%
+  #select(genotype,  term, estimate, treatment, rate.type) %>%
+  #spread(term, estimate) %>%
+  mutate(Pmax = schoolfield_high(lnc = lnc, E = E, Th = Th, Eh = Eh, temp = Topt_data$Topt, Tc = 20.2)) %>% #add in factors that make up schoolfield function, reference topt to get pmax
+  group_by(., individual.ID, rate.type, Ambient_Nutrient, Species)
+
+
+write.csv(Pmax, "Pmax_derived.csv")
+```
+
+
+#######Normality testing and outlier removal########
+
+#QQ Plots by species, treatment type, and rate type
+```{r}
+library(ggplot2)
+
+ggplot(data = subset(Topt_data, Species == "Pad" & rate.type == "Net Photosynthesis" & Ambient_Nutrient == "Enriched"),
+       aes(sample = Topt)) +
+  geom_qq() +
+  stat_qq_line() +
+  facet_grid(. ~ Ambient_Nutrient + rate.type + Species, scales = "free") +
+  labs(title = "QQ Plot by Treatment, Rate, and Species",
+       x = "Theoretical Quantiles", y = "Sample Quantiles")
+
+##Do this for every treatment combination##
+```
+
+#Histogram by species, treatment type, and rate type
+```{r}
+library(ggplot2)
+
+ggplot(Topt_data, aes(x=Topt, fill=Species)) +
+  geom_histogram(alpha=0.5, position="identity", bins=2.5) +
+  scale_fill_manual(values=c("Caul" = "olivedrab","Ulv" = "olivedrab3", "Grac" = "orangered2", "Pad" = "lightsalmon4")) +
+  labs(x="Topt", y="Count") +
+  facet_grid(Ambient_Nutrient ~ rate.type + Species, scales="free") +
+  theme_classic()
+```
+
+#Outlier removal method IQR*1.5 for Topt, E, Eh, Pmax
+```{r}
+# Your dataset with a single variable (e.g., "data")
+data <- c(84.14238707,8.580602643,-6.389630112,82.45446534,-7.489741474)
+
+# Set a threshold for Z-scores to identify outliers
+threshold <- 1.5  # You can adjust this threshold as needed
+
+# Initialize a variable to store outliers
+all_outliers <- c()
+
+while (TRUE) {
+  # Calculate the mean and standard deviation of the data
+  mean_data <- mean(data)
+  sd_data <- sd(data)
+
+  # Calculate Z-scores for each data point
+  z_scores <- (data - mean_data) / sd_data
+
+  # Identify outliers
+  outliers <- which(abs(z_scores) > threshold)
+  
+  # If no outliers are found, break the loop
+  if (length(outliers) == 0) {
+    break
+  }
+  
+  # Print and store the outliers
+  cat("Outliers:", data[outliers], "\n")
+  all_outliers <- c(all_outliers, data[outliers])
+  
+  # Remove the first outlier found
+  data <- data[-outliers[1]]
+}
+
+# Print all outliers
+cat("All outliers:", all_outliers, "\n")
+```
+
+
+#######Thermal parameter mean (+/-95% CI) bar plots for NP & R####### 
+
+#Net photosynthesis param mean plots
+
+#Pmax_NP
+```{r}
+pmax_data_NP<-read.csv('Pmax.csv')
+
+# Define the custom order of Species
+species_order <- c("Grac", "Pad", "Caul", "Ulv")
+
+# Convert Species to factor with the custom order
+pmax_data_NP$Species <- factor(pmax_data_NP$Species, levels = species_order)
+
+Pmax_data_filtered <- pmax_data_NP %>%
+  filter(rate.type == "Net Photosynthesis" & Ambient_Nutrient %in% c("Ambient", "Enriched"))
+
+
+
+library(dplyr)
+Pmax_data_filtered_summary <- Pmax_data_filtered %>%
+  dplyr::group_by(Species, Ambient_Nutrient) %>%
+  dplyr::summarise(Pmax_mean = mean(Pmax), 
+                   sd = sd(Pmax),
+                   n = n()) %>%
+  mutate(se = qt(0.975, df = n - 1) * (sd / sqrt(n))) %>%
+  ungroup()
+
+
+Pmax_NP<- ggplot() + 
+  geom_point(data = Pmax_data_filtered_summary, aes(x = Species, y = Pmax_mean, 
+               color = Ambient_Nutrient), shape = "-", size = 32.5, 
+               position = position_dodge(width = 0.85)) +
+  geom_errorbar(data = Pmax_data_filtered_summary, 
+                aes(x = Species, ymin = Pmax_mean - se, ymax = Pmax_mean + se, 
+                    colour = Ambient_Nutrient),  
+                size = 12, width = 0, alpha = 0.6, 
+                position = position_dodge(width = 0.85)) +
+  geom_jitter(data = Pmax_data_filtered, 
+              aes(x = Species, y = Pmax, 
+                  colour = Ambient_Nutrient),
+              size = 1.5, alpha = 0.5, 
+              position = position_jitterdodge(jitter.width = 0.2,
+                                               jitter.height = 0.02, 
+                                               dodge.width = 0.85)) +
+    theme(axis.text.x = element_text(size = 18, angle = 0, hjust = 0.5, colour = "white", face = "italic"),
+        axis.text.y = element_text(size = 18, color = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black"),
+        strip.text.x = element_blank(),
+        axis.line.x.top = element_blank(),
+        axis.line.y.right = element_blank(),
+        legend.position = "none",
+        legend.text = element_text(size = 17),
+        legend.title = element_text(size = 19),
+axis.title.x = element_text(size = 22, margin = margin(t = 15)), # Adjust the margin here
+        axis.title.y = element_text(size = 20, colour = "black"),  # Adjust the margin here
+        plot.title = element_text(size = 27, face = "bold", hjust = -.1)) +
+  scale_x_discrete(labels = c("Ochtodes", "Padina", "Caulerpa", "Ulva")) +
+  scale_y_continuous(limits = c(4.69, 7), breaks = seq(5, 7, by = 1)) +
+  ggtitle(expression(bold("b  ")~italic(P[plain(max)])))+
+  #ggtitle(bquote(italic(P[plain(max)]))) + 
+  labs(x = "", y = expression(Rate~(log~mu*mol~O[2]~g^-1~hr^-1))) +
+  scale_color_manual(values = c("seagreen2", "seagreen"))  # Change colors here
+
+Pmax_NP
+```
+
+#Topt_NP
+```{r}
+Topt_data_NP<-read.csv('Output_analysis/Topt.csv')
+Topt_data_NP$Topt <- Topt_data_NP$Topt - 273.15
+
+# Define the custom order of Species
+species_order <- c("Grac", "Pad", "Caul", "Ulv")
+
+# Convert Species to factor with the custom order
+Topt_data_NP$Species <- factor(Topt_data_NP$Species, levels = species_order)
+
+# Filter the data
+Topt_data_filtered <- Topt_data_NP %>%
+  filter(rate.type == "Net Photosynthesis" & Ambient_Nutrient %in% c("Ambient", "Enriched"))
+
+library(dplyr)
+Topt_data_filtered_summary <- Topt_data_filtered %>%
+  dplyr::group_by(Species, Ambient_Nutrient) %>%
+  dplyr::summarise(Topt_mean = mean(Topt), 
+                   sd = sd(Topt),
+                   n = n()) %>%
+  mutate(se = qt(0.975, df = n - 1) * (sd / sqrt(n))) %>%
+  ungroup()
+
+
+Topt_NP <- ggplot() + 
+  geom_point(data = Topt_data_filtered_summary, aes(x = Species, y = Topt_mean, 
+               color = Ambient_Nutrient), shape = "-", size = 32.5, 
+               position = position_dodge(width = 0.85)) +
+  geom_errorbar(data = Topt_data_filtered_summary, 
+                aes(x = Species, ymin = Topt_mean - se, ymax = Topt_mean + se, 
+                    colour = Ambient_Nutrient),  
+                size = 12, width = 0, alpha = 0.6, 
+                position = position_dodge(width = 0.85)) +
+  geom_jitter(data = Topt_data_filtered, 
+              aes(x = Species, y = Topt, 
+                  colour = Ambient_Nutrient),
+              size = 1.5, alpha = 0.5, 
+              position = position_jitterdodge(jitter.width = 0.2,
+                                               jitter.height = 0.02, 
+                                               dodge.width = 0.85)) +
+    theme(axis.text.x = element_text(size = 18, angle = 0, hjust = 0.5, colour = "white", face = "italic"),
+        axis.text.y = element_text(size = 18, color = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black"),
+        strip.text.x = element_blank(),
+        axis.line.x.top = element_blank(),
+        axis.line.y.right = element_blank(),
+        legend.position = "none",
+        legend.text = element_text(size = 17),
+        legend.title = element_text(size = 19),
+        axis.title.x = element_text(size = 22, margin = margin(t = 15)), # Adjust the margin here
+        axis.title.y = element_text(size = 20, colour = "black"),  # Adjust the margin here
+        plot.title = element_text(size = 27, face = "bold", hjust = -.1)) +
+  scale_x_discrete(labels = c("Ochtodes", "Padina", "Caulerpa", "Ulva")) +
+  scale_y_continuous(limits = c(25.69, 37), breaks = seq(25, 37, by = 3)) +
+  ggtitle(expression(bold("a  ")~italic(T[plain(opt)])))+
+  #ggtitle(bquote(italic(T[plain(opt)]))) + 
+  labs(x = "", y = "Temperature (°C)") +
+  scale_color_manual(values = c("seagreen2", "seagreen"))  # Change colors here
+
+Topt_NP
+```
+
+#E_NP
+```{r}
+E_data_NP<-read.csv('Output_analysis/E.csv')
+#E_data_NP$E <- E_data_NP$E - 273.15
+
+# Define the custom order of Species
+species_order <- c("Grac", "Pad", "Caul", "Ulv")
+
+# Convert Species to factor with the custom order
+E_data_NP$Species <- factor(E_data_NP$Species, levels = species_order)
+
+# Filter the data
+E_data_filtered <- E_data_NP %>%
+  filter(rate.type == "Net Photosynthesis" & Ambient_Nutrient %in% c("Ambient", "Enriched"))
+
+library(dplyr)
+E_data_filtered_summary <- E_data_filtered %>%
+  dplyr::group_by(Species, Ambient_Nutrient) %>%
+  dplyr::summarise(E_mean = mean(E), 
+                   sd = sd(E),
+                   n = n()) %>%
+  mutate(se = qt(0.975, df = n - 1) * (sd / sqrt(n))) %>%
+  ungroup()
+
+E_NP <- ggplot() + 
+  geom_point(data = E_data_filtered_summary, aes(x = Species, y = E_mean, 
+               color = Ambient_Nutrient), shape = "-", size = 32.5, 
+               position = position_dodge(width = 0.85)) +
+  geom_errorbar(data = E_data_filtered_summary, 
+                aes(x = Species, ymin = E_mean - se, ymax = E_mean + se, 
+                    colour = Ambient_Nutrient),  
+                size = 12, width = 0, alpha = 0.6, 
+                position = position_dodge(width = 0.85)) +
+  geom_jitter(data = E_data_filtered, 
+              aes(x = Species, y = E, 
+                  colour = Ambient_Nutrient),
+              size = 1.5, alpha = 0.5, 
+              position = position_jitterdodge(jitter.width = 0.2,
+                                               jitter.height = 0.02, 
+                                               dodge.width = 0.85)) +
+    theme(axis.text.x = element_text(size = 18, angle = 0, hjust = 0.5, colour = "black", face = "italic"),
+        axis.text.y = element_text(size = 18, color = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black"),
+        strip.text.x = element_blank(),
+        axis.line.x.top = element_blank(),
+        axis.line.y.right = element_blank(),
+        legend.position = "none",
+        legend.text = element_text(size = 17),
+        legend.title = element_text(size = 19),
+axis.title.x = element_text(size = 22, margin = margin(t = 15)), # Adjust the margin here
+        axis.title.y = element_text(size = 20, colour = "black"), # Adjust the margin here
+        plot.title = element_text(size = 27, face = "bold", hjust = -.1)) +
+  scale_x_discrete(labels = c("Ochtodes", "Padina", "Caulerpa", "Ulva")) +
+  scale_y_continuous(limits = c(0, 1.115), breaks = seq(0, 1, by = 0.5)) +
+  ggtitle(expression(bold("c  ")~italic(E)))+
+  #ggtitle(bquote(italic(E))) + 
+  labs(x = "Genera", y = "Energy (eV)") +
+  scale_color_manual(values = c("seagreen2", "seagreen"))  # Change colors here
+
+E_NP
+```
+
+#Eh_NP
+```{r}
+Eh_data_NP<-read.csv('Output_analysis/Eh.csv')
+#E_data_NP$E <- E_data_NP$E - 273.15
+
+# Define the custom order of Species
+species_order <- c("Grac", "Pad", "Caul", "Ulv")
+
+# Convert Species to factor with the custom order
+Eh_data_NP$Species <- factor(Eh_data_NP$Species, levels = species_order)
+
+# Filter the data
+Eh_data_filtered <- Eh_data_NP %>%
+  filter(rate.type == "Net Photosynthesis" & Ambient_Nutrient %in% c("Ambient", "Enriched"))
+
+library(dplyr)
+Eh_data_filtered_summary <- Eh_data_filtered %>%
+  dplyr::group_by(Species, Ambient_Nutrient) %>%
+  dplyr::summarise(Eh_mean = mean(Eh), 
+                   sd = sd(Eh),
+                   n = n()) %>%
+  mutate(se = qt(0.975, df = n - 1) * (sd / sqrt(n))) %>%
+  ungroup()
+
+library(ggplot2)
+
+Eh_NP <- ggplot() + 
+  geom_point(data = Eh_data_filtered_summary, aes(x = Species, y = Eh_mean, 
+               color = Ambient_Nutrient), shape = "-", size = 32.5, 
+               position = position_dodge(width = 0.85)) +
+  geom_errorbar(data = Eh_data_filtered_summary, 
+                aes(x = Species, ymin = Eh_mean - se, ymax = Eh_mean + se, 
+                    colour = Ambient_Nutrient),  
+                size = 12, width = 0, alpha = 0.6, 
+                position = position_dodge(width = 0.85)) +
+  geom_jitter(data = Eh_data_filtered, 
+              aes(x = Species, y = Eh, 
+                  colour = Ambient_Nutrient),
+              size = 1.5, alpha = 0.5, 
+              position = position_jitterdodge(jitter.width = 0.2,
+                                               jitter.height = 0.02, 
+                                               dodge.width = 0.85)) +
+    theme(axis.text.x = element_text(size = 18, angle = 0, hjust = 0.5, colour = "black", face = "italic"),
+        axis.text.y = element_text(size = 18, color = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black"),
+        strip.text.x = element_blank(),
+        axis.line.x.top = element_blank(),
+        axis.line.y.right = element_blank(),
+        legend.position = "none",
+        legend.text = element_text(size = 17),
+        legend.title = element_text(size = 19),
+        axis.title.x = element_text(size = 22, margin = margin(t = 15)), # Adjust the margin here
+        axis.title.y = element_text(size = 20, colour = "white"), 
+        plot.title = element_text(size = 27, face = "bold", hjust = -.1)) +
+  scale_x_discrete(labels = c("Ochtodes", "Padina", "Caulerpa", "Ulva")) +
+  scale_y_continuous(limits = c(2, 20.74), breaks = seq(2, 20, by = 2)) +
+  ggtitle(expression(bold("d  ")~italic(E[plain(h)]))) +
+  #ggtitle(bquote(italic(E[plain(h)]))) + 
+  labs(x = "Genera", y = " Deactivation Energy (eV)") +
+  scale_color_manual(values = c("seagreen2", "seagreen"))  # Change colors here
+
+Eh_NP
+```
+
+#Arrange the NP plots into a 2x2 panel grid
+```{r}
+library(gridExtra)
+grid.arrange(Topt_NP, Pmax_NP, E_NP, Eh_NP)
+```
+
+
+#Respiration param mean plots
+
+#Pmax_R
+```{r}
+pmax_data_R<-read.csv('pmax.csv')
+
+# Define the custom order of Species
+species_order <- c("Grac", "Pad", "Caul", "Ulv")
+
+# Convert Species to factor with the custom order
+pmax_data_R$Species <- factor(pmax_data_R$Species, levels = species_order)
+
+Pmax_data_filtered <- pmax_data_R %>%
+  filter(rate.type == "Respiration" & Ambient_Nutrient %in% c("Ambient"))
+
+library(dplyr)
+Pmax_data_filtered_summary <- Pmax_data_filtered %>%
+  dplyr::group_by(Species, Ambient_Nutrient) %>%
+  dplyr::summarise(Pmax_mean = mean(Pmax), 
+                   sd = sd(Pmax),
+                   n = n()) %>%
+  mutate(se = qt(0.975, df = n - 1) * (sd / sqrt(n))) %>%
+  ungroup()
+
+
+Pmax_R<- ggplot() + 
+  geom_point(data = Pmax_data_filtered_summary, aes(x = Species, y = Pmax_mean, 
+               color = Ambient_Nutrient), shape = "-", size = 32.5, 
+               position = position_dodge(width = 0.85)) +
+  geom_errorbar(data = Pmax_data_filtered_summary, 
+                aes(x = Species, ymin = Pmax_mean - se, ymax = Pmax_mean + se, 
+                    colour = Ambient_Nutrient),  
+                size = 12, width = 0, alpha = 0.6, 
+                position = position_dodge(width = 0.85)) +
+  geom_jitter(data = Pmax_data_filtered, 
+              aes(x = Species, y = Pmax, 
+                  colour = Ambient_Nutrient),
+              size = 1.5, alpha = 0.5, 
+              position = position_jitterdodge(jitter.width = 0.2,
+                                               jitter.height = 0.02, 
+                                               dodge.width = 0.85)) +
+  theme(axis.text.x = element_text(face = "italic", size = 11, color = "black"),
+        axis.text.y = element_text(size = 18, color = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black"),
+        strip.text.x = element_blank(),
+        axis.line.x.top = element_blank(),
+        axis.line.y.right = element_blank(),
+        legend.position = "none",
+        legend.text = element_text(size = 17),
+        legend.title = element_text(size = 19),
+        axis.title.x = element_text(size = 22, margin = margin(t = 15)), # Adjust the margin here
+        axis.title.y = element_text(size = 20, colour = "black"), 
+        plot.title = element_text(size = 27, face = "bold", hjust = -.1)) +
+  scale_x_discrete(labels = c("Ochtodes", "Padina", "Caulerpa", "Ulva")) +
+  scale_y_continuous(limits = c(3, 5.5), breaks = seq(3, 5, by = 1)) +
+   theme(legend.text = element_text(size = 13),
+                legend.title = element_text(size = 15),
+                axis.title.x = element_text(size = 20),
+                axis.title.y = element_text(size = 20),
+                axis.text.x = element_text(face = "italic", size = 20), 
+                axis.text.y = element_text(size = 20))+
+  theme(legend.text = element_text(size = 17),
+          legend.title = element_text(size = 19),
+                axis.title.x = element_text(size = 20),
+                axis.title.y = element_text(size = 22),
+                axis.text.x = element_blank(),
+                axis.text.y = element_text(size = 18),
+       plot.title = element_text(size = 27, face = "bold")) +
+  ggtitle(expression(bold("b  ")~italic(P[plain(max)])))+
+  #ggtitle(bquote(italic(P[plain(max)]))) + 
+  labs(x = "", y = expression(Rate~(log~mu*mol~O[2]~g^-1~hr^-1))) +
+  scale_color_manual(values = c("deepskyblue1")) 
+
+Pmax_R
+```
+
+#Topt_R
+```{r}
+Topt_data_R<-read.csv('Output_analysis/Topt.csv')
+Topt_data_R$Topt <- Topt_data_R$Topt - 273.15
+
+# Define the custom order of Species
+species_order <- c("Grac", "Pad", "Caul", "Ulv")
+
+# Convert Species to factor with the custom order
+Topt_data_R$Species <- factor(Topt_data_R$Species, levels = species_order)
+
+# Filter the data
+Topt_data_filtered <- Topt_data_R %>%
+  filter(rate.type == "Respiration" & Ambient_Nutrient %in% c("Ambient"))
+
+library(dplyr)
+Topt_data_filtered_summary <- Topt_data_filtered %>%
+  dplyr::group_by(Species, Ambient_Nutrient) %>%
+  dplyr::summarise(Topt_mean = mean(Topt), 
+                   sd = sd(Topt),
+                   n = n()) %>%
+  mutate(se = qt(0.975, df = n - 1) * (sd / sqrt(n))) %>%
+  ungroup()
+
+Topt_R <- ggplot() + 
+  geom_point(data = Topt_data_filtered_summary, aes(x = Species, y = Topt_mean, 
+               color = Ambient_Nutrient), shape = "-", size = 32.5, 
+               position = position_dodge(width = 0.85)) +
+  geom_errorbar(data = Topt_data_filtered_summary, 
+                aes(x = Species, ymin = Topt_mean - se, ymax = Topt_mean + se, 
+                    colour = Ambient_Nutrient),  
+                size = 12, width = 0, alpha = 0.6, 
+                position = position_dodge(width = 0.85)) +
+  geom_jitter(data = Topt_data_filtered, 
+              aes(x = Species, y = Topt, 
+                  colour = Ambient_Nutrient),
+              size = 1.5, alpha = 0.5, 
+              position = position_jitterdodge(jitter.width = 0.2,
+                                               jitter.height = 0.02, 
+                                               dodge.width = 0.85)) +
+  theme(axis.text.x = element_text(face = "italic", size = 11, color = "black"),
+        axis.text.y = element_text(size = 18, color = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black"),
+        strip.text.x = element_blank(),
+        axis.line.x.top = element_blank(),
+        axis.line.y.right = element_blank(),
+        legend.position = "none",
+        legend.text = element_text(size = 17),
+        legend.title = element_text(size = 19),
+        axis.title.x = element_text(size = 22, margin = margin(t = 15)), # Adjust the margin here
+        axis.title.y = element_text(size = 20, colour = "black"), 
+        plot.title = element_text(size = 27, face = "bold", hjust = -.1)) +
+  scale_x_discrete(labels = c("Ochtodes", "Padina", "Caulerpa", "Ulva")) +
+  scale_y_continuous(limits = c(25, 43), breaks = seq(25, 43, by = 3))+
+  theme(legend.text = element_text(size = 17),
+            legend.title = element_text(size = 19),
+                axis.title.x = element_text(size = 20),
+                axis.title.y = element_text(size = 25),
+                axis.text.x = element_blank(),
+                axis.text.y = element_text(size = 18),
+       plot.title = element_text(size = 27, face = "bold")) +
+  ggtitle(expression(bold("a  ")~italic(T[plain(opt)])))+
+  #ggtitle(bquote(italic(T[plain(opt)]))) + 
+  labs(x = "", y = "Temperature (°C)") +
+  scale_color_manual(values = c("deepskyblue1")) 
+
+Topt_R
+```
+
+#E_R
+```{r}
+E_data_R<-read.csv('Output_analysis/E.csv')
+#E_data_NP$E <- E_data_NP$E - 273.15
+
+# Define the custom order of Species
+species_order <- c("Grac", "Pad", "Caul", "Ulv")
+
+# Convert Species to factor with the custom order
+E_data_R$Species <- factor(E_data_R$Species, levels = species_order)
+
+# Filter the data
+E_data_filtered <- E_data_R %>%
+  filter(rate.type == "Respiration" & Ambient_Nutrient %in% c("Ambient"))
+
+library(dplyr)
+E_data_filtered_summary <- E_data_filtered %>%
+  dplyr::group_by(Species, Ambient_Nutrient) %>%
+  dplyr::summarise(E_mean = mean(E), 
+                   sd = sd(E),
+                   n = n()) %>%
+  mutate(se = qt(0.975, df = n - 1) * (sd / sqrt(n))) %>%
+  ungroup()
+
+E_R <- ggplot() + 
+  geom_point(data = E_data_filtered_summary, aes(x = Species, y = E_mean, 
+               color = Ambient_Nutrient), shape = "-", size = 32.5, 
+               position = position_dodge(width = 0.85)) +
+  geom_errorbar(data = E_data_filtered_summary, 
+                aes(x = Species, ymin = E_mean - se, ymax = E_mean + se, 
+                    colour = Ambient_Nutrient),  
+                size = 12, width = 0, alpha = 0.6, 
+                position = position_dodge(width = 0.85)) +
+  geom_jitter(data = E_data_filtered, 
+              aes(x = Species, y = E, 
+                  colour = Ambient_Nutrient),
+              size = 1.5, alpha = 0.5, 
+              position = position_jitterdodge(jitter.width = 0.2,
+                                               jitter.height = 0.02, 
+                                               dodge.width = 0.85)) +
+  theme(axis.text.x = element_text(face = "italic", size = 11, color = "black"),
+        axis.text.y = element_text(size = 18, color = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black"),
+        strip.text.x = element_blank(),
+        axis.line.x.top = element_blank(),
+        axis.line.y.right = element_blank(),
+        legend.position = "none",
+        legend.text = element_text(size = 17),
+        legend.title = element_text(size = 19),
+        axis.title.x = element_text(size = 22, margin = margin(t = 15)), # Adjust the margin here
+        axis.title.y = element_text(size = 20, colour = "black"), 
+        plot.title = element_text(size = 27, face = "bold", hjust = -.1)) +
+  scale_x_discrete(labels = c("Ochtodes", "Padina", "Caulerpa", "Ulva")) +
+  scale_y_continuous(limits = c(0, 1.48), breaks = seq(0, 1.5, by = 0.5))+
+  theme(legend.text = element_text(size = 17),
+              legend.title = element_text(size = 19),
+        axis.title.x = element_text(size = 22),
+        axis.title.y = element_text(size = 25),
+        axis.text.x = element_text(face = "italic", size = 20),
+        axis.text.y = element_text(size = 18),
+       plot.title = element_text(size = 27, face = "bold")) +
+ggtitle(expression(bold("c  ")~"Log "~italic(E)))+
+#ggtitle(expression(paste("Log ", italic("E")))) +
+labs(x = "Genera", y = "Energy (eV)") +
+scale_color_manual(values = c("deepskyblue1")) 
+
+E_R
+```
+
+
+#Eh_R
+```{r}
+Eh_data_R<-read.csv('Output_analysis/Eh.csv')
+#E_data_NP$E <- E_data_NP$E - 273.15
+
+# Define the custom order of Species
+species_order <- c("Grac", "Pad", "Caul", "Ulv")
+
+# Convert Species to factor with the custom order
+Eh_data_R$Species <- factor(Eh_data_R$Species, levels = species_order)
+
+# Filter the data
+Eh_data_filtered <- Eh_data_R %>%
+  filter(rate.type == "Respiration" & Ambient_Nutrient %in% c("Ambient"))
+
+library(dplyr)
+Eh_data_filtered_summary <- Eh_data_filtered %>%
+  dplyr::group_by(Species, Ambient_Nutrient) %>%
+  dplyr::summarise(Eh_mean = mean(Eh), 
+                   sd = sd(Eh),
+                   n = n()) %>%
+  mutate(se = qt(0.975, df = n - 1) * (sd / sqrt(n))) %>%
+  ungroup()
+
+library(ggplot2)
+
+Eh_R <- ggplot() + 
+  geom_point(data = Eh_data_filtered_summary, aes(x = Species, y = Eh_mean, 
+               color = Ambient_Nutrient), shape = "-", size = 32.5, 
+               position = position_dodge(width = 0.85)) +
+  geom_errorbar(data = Eh_data_filtered_summary, 
+                aes(x = Species, ymin = Eh_mean - se, ymax = Eh_mean + se, 
+                    colour = Ambient_Nutrient),  
+                size = 12, width = 0, alpha = 0.6, 
+                position = position_dodge(width = 0.85)) +
+  geom_jitter(data = Eh_data_filtered, 
+              aes(x = Species, y = Eh, 
+                  colour = Ambient_Nutrient),
+              size = 1.5, alpha = 0.5, 
+              position = position_jitterdodge(jitter.width = 0.2,
+                                               jitter.height = 0.02, 
+                                               dodge.width = 0.85)) +
+  theme(axis.text.x = element_text(face = "italic", size = 11, color = "black"),
+        axis.text.y = element_text(size = 18, color = "black"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_rect(fill = "white"),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black"),
+        strip.text.x = element_blank(),
+        axis.line.x.top = element_blank(),
+        axis.line.y.right = element_blank(),
+        legend.position = "none",
+        legend.text = element_text(size = 17),
+        legend.title = element_text(size = 19),
+        axis.title.x = element_text(size = 22, margin = margin(t = 15)), # Adjust the margin here
+        axis.title.y = element_text(size = 20, colour = "white"), 
+        plot.title = element_text(size = 27, face = "bold", hjust =-.1)) +
+  scale_x_discrete(labels = c("Ochtodes", "Padina", "Caulerpa", "Ulva")) +
+  scale_y_continuous(limits = c(0, 65), breaks = seq(0, 65, by = 10))+
+  theme(legend.text = element_text(size = 17),
+             legend.title = element_text(size = 19),
+                axis.title.x = element_text(size = 22),
+                axis.title.y = element_text(size = 23),
+                axis.text.x = element_text(face = "italic", size = 20),
+                axis.text.y = element_text(size = 18),
+       plot.title = element_text(size = 27, face = "bold")) +
+ggtitle(expression(bold("d  ")~"Log "~italic(E[plain(h)]))) +
+labs(x = "Genera", y = "Energy (eV)") +
+scale_color_manual(values = c("deepskyblue1")) 
+
+Eh_R
+```
+
+#Arrange the R plots into a 2x2 panel grid
+```{r}
+library(gridExtra)
+grid.arrange(Topt_R, Pmax_R, E_R, Eh_R)
+```
+
+
+#######Thermal performance curves using SS-model derived predictions####### 
+
+#Ulva all individual lines per treatment
+```{r}
+# preds2 <- read.csv('Output_analysis/preds2.csv')
+# mydata <- read.csv('Output/Photo.RNPP.csv')
+# 
+# library(ggplot2)
+# 
+# # Filter "Pad" species in mydata and exclude "Enriched Respiration"
+# mydataulv <- mydata[mydata$Species == "Ulv" & mydata$Condition != "RespirationNutrient", ]
+# 
+# # Filter "Pad" species in preds2 and exclude "Enriched Respiration"
+# preds2ulv <- preds2[preds2$Species == "Ulv" & preds2$Condition != "RespirationNutrient", ]
+# 
+# # Create the ggplot with the filtered data
+# Ulv_all <- ggplot(data = mydataulv) +
+#   geom_point(aes(K - 273.15, log.rate, col = Condition), size = 2) +
+#   geom_line(aes(K - 273.15, ln.rate, col = Condition, group = individual.ID), alpha = 0.5, data = preds2ulv) +
+#   scale_color_manual(values = c("RespirationAmbient" = "deepskyblue1", "Net PhotosynthesisAmbient" = "seagreen2", "Net PhotosynthesisNutrient" = "seagreen")) +
+#   theme_bw(base_size = 12, base_family = 'Helvetica') +
+#   ylab('') +  # Empty string for y-axis label
+#   xlab('') +
+#   facet_grid(~ Species, scales = "free_y") +
+#   theme(strip.text.x = element_blank(),
+#         strip.background = element_blank()) +  # Remove facet labels
+#   theme(legend.position = "none",
+#         axis.text.x = element_text(face = "plain", color = "black", size = 19),
+#         axis.text.y = element_text(face = "plain", color = "black", size = 19),
+#         axis.title.x = element_text(color = "black", size = 25, face = "plain"),
+#         axis.title.y = element_text(color = "black", size = 23, face = "plain"),
+#         panel.grid.major = element_blank(),
+#         panel.grid.minor = element_blank(),
+#         panel.border = element_blank(),  # Remove border
+#         axis.line = element_line(color = "black"),  # Adjust axis line if needed
+#         axis.ticks = element_line(color = "black"),
+#         plot.title = element_text(size = 24)) +   # Adjust axis ticks if needed
+#   labs(col = "Treatment") +
+#   ggtitle(expression(italic("Ulva")~plain("spp.")))
+#   # Set title in italics
+# 
+# # Display the filtered plot
+# print(Ulv_all)
+```
+
+#Ulva mean lines per treatment
+```{r}
+preds2 <- read.csv('Output_analysis/preds2.csv')
+mydata <- read.csv('Output/Photo.RNPP.csv')
+
+library(ggplot2)
+
+# Filter "Pad" species in mydata and exclude "Enriched Respiration"
+mydataulv <- mydata[mydata$Species == "Ulv" & mydata$Condition != "RespirationNutrient", ]
+
+# Filter "Pad" species in preds2 and exclude "Enriched Respiration"
+preds2ulv <- preds2[preds2$Species == "Ulv" & preds2$Condition != "RespirationNutrient", ]
+
+
+# Calculate mean values for each condition
+mean_data <- aggregate(log.rate ~ Condition + K, data = mydataulv, FUN = mean)
+
+# Create the ggplot with the filtered data and mean lines
+Ulv <- ggplot(data = mydataulv) +
+  geom_point(aes(K - 273.15, log.rate, col = Condition), size = 2) +
+  geom_smooth(aes(K - 273.15, ln.rate, col = Condition, fill = Condition), method = "loess", se = TRUE, size = 0.25, span = 0.04, alpha = 0.28, data = preds2ulv) +
+  scale_color_manual(values = c("RespirationAmbient" = "deepskyblue1", "Net PhotosynthesisAmbient" = "seagreen2", "Net PhotosynthesisNutrient" = "seagreen"),
+                     guide = "none") +
+  scale_fill_manual(values = c("RespirationAmbient" = "deepskyblue1", "Net PhotosynthesisAmbient" = "seagreen2", "Net PhotosynthesisNutrient" = "seagreen")) +
+  theme_bw(base_size = 12, base_family = 'Helvetica') +
+  ylab('') +  # Empty string for y-axis label
+  xlab('Temperature (ºC)') +
+  facet_grid(~ Species, scales = "free_y") +
+  theme(strip.text.x = element_blank(),
+        strip.background = element_blank(),
+        legend.position = "none",
+        axis.text.x = element_text(face = "plain", color = "black", size = 18), 
+        axis.text.y = element_text(face = "plain", color = "black", size = 18),
+        axis.title.x = element_text(color = "black", size = 23, face = "plain"),
+        axis.title.y = element_text(color = "black", size = 23, face = "plain"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.ticks = element_line(color = "black"),
+        plot.title = element_text(size = 22, face = "bold", hjust = -.15)) +
+  scale_y_continuous(limits = c(0, 7.065), breaks = seq(0, 7, by = 1)) +
+  labs(col = "Treatment") +
+  #ggtitle(expression(bold("b  ")~italic(P[plain(max)])))+
+  ggtitle(expression(bold("d  ")~italic("Ulva")~plain("spp.")))
+  #geom_hline(yintercept = 0, linetype = "dashed", color = "black")
+
+print(Ulv)
+
+```
+
+
+#Padina all individual lines per treatment
+```{r}
+# preds2 <- read.csv('Output_analysis/preds2.csv')
+# mydata <- read.csv('Output/Photo.RNPP.csv')
+# 
+# library(ggplot2)
+# 
+# # Filter "Pad" species in mydata and exclude "Enriched Respiration"
+# mydatapad <- mydata[mydata$Species == "Pad" & mydata$Condition != "RespirationNutrient", ]
+# 
+# # Filter "Pad" species in preds2 and exclude "Enriched Respiration"
+# preds2pad <- preds2[preds2$Species == "Pad" & preds2$Condition != "RespirationNutrient", ]
+# 
+# # Create the ggplot with the filtered data
+# Pad_all <- ggplot(data = mydatapad) +
+#   geom_point(aes(K - 273.15, log.rate, col = Condition), size = 2) +
+#   geom_line(aes(K - 273.15, ln.rate, col = Condition, group = individual.ID), alpha = 0.5, data = preds2pad) +
+#   scale_color_manual(values = c("RespirationAmbient" = "deepskyblue1", "Net PhotosynthesisAmbient" = "seagreen2", "Net PhotosynthesisNutrient" = "seagreen")) +
+#   theme_bw(base_size = 12, base_family = 'Helvetica') +
+#   ylab('') +  # Empty string for y-axis label
+#   xlab('') +
+#   facet_grid(~ Species, scales = "free_y") +
+#   theme(strip.text.x = element_blank(),
+#         strip.background = element_blank()) +  # Remove facet labels
+#   theme(legend.position = "none",
+#         axis.text.x = element_text(face = "plain", color = "black", size = 19), 
+#         axis.text.y = element_text(face = "plain", color = "black", size = 19),
+#         axis.title.x = element_text(color = "black", size = 25, face = "plain"),
+#         axis.title.y = element_text(color = "black", size = 23, face = "plain"),
+#         panel.grid.major = element_blank(),
+#         panel.grid.minor = element_blank(),
+#         panel.border = element_blank(),  # Remove border
+#         axis.line = element_line(color = "black"),  # Adjust axis line if needed
+#         axis.ticks = element_line(color = "black"),
+#         plot.title = element_text(size = 24)) +   # Adjust axis ticks if needed
+#   labs(col = "Treatment") +
+#   ggtitle(expression(italic("Padina")~plain("spp.")))
+#   # Set title in italics
+# 
+# # Display the filtered plot
+# print(Pad_all)
+```
+
+#Padina mean lines per treatment
+```{r}
+preds2 <- read.csv('Output_analysis/preds2.csv')
+mydata <- read.csv('Output/Photo.RNPP.csv')
+
+library(ggplot2)
+
+# Filter "Pad" species in mydata and exclude "Enriched Respiration"
+mydatapad <- mydata[mydata$Species == "Pad" & mydata$Condition != "RespirationNutrient", ]
+
+# Filter "Pad" species in preds2 and exclude "Enriched Respiration"
+preds2pad <- preds2[preds2$Species == "Pad" & preds2$Condition != "RespirationNutrient", ]
+
+
+# Calculate mean values for each condition
+mean_data <- aggregate(log.rate ~ Condition + K, data = mydatapad, FUN = mean)
+
+# Create the ggplot with the filtered data and mean lines
+Pad <- ggplot(data = mydatapad) +
+  geom_point(aes(K - 273.15, log.rate, col = Condition), size = 2) +
+  geom_smooth(aes(K - 273.15, ln.rate, col = Condition, fill = Condition), method = "loess", se = TRUE, size = 0.25, span = 0.04, alpha = 0.28, data = preds2pad) +
+  scale_color_manual(values = c("RespirationAmbient" = "deepskyblue1", "Net PhotosynthesisAmbient" = "seagreen2", "Net PhotosynthesisNutrient" = "seagreen"),
+                     guide = "none") +
+  scale_fill_manual(values = c("RespirationAmbient" = "deepskyblue1", "Net PhotosynthesisAmbient" = "seagreen2", "Net PhotosynthesisNutrient" = "seagreen")) +
+  theme_bw(base_size = 12, base_family = 'Helvetica') +
+  ylab('') +  # Empty string for y-axis label
+  xlab('') +
+  facet_grid(~ Species, scales = "free_y") +
+  theme(strip.text.x = element_blank(),
+        strip.background = element_blank(),
+        legend.position = "none",
+        axis.text.x = element_text(face = "plain", color = "black", size = 18), 
+        axis.text.y = element_text(face = "plain", color = "black", size = 18),
+        axis.title.x = element_text(color = "black", size = 23, face = "plain"),
+        axis.title.y = element_text(color = "black", size = 23, face = "plain"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.ticks = element_line(color = "black"),
+        plot.title = element_text(size = 22, face = "bold", hjust = -.15)) +
+  scale_y_continuous(limits = c(-0.74, 7), breaks = seq(0, 7, by = 1)) +
+  labs(col = "Treatment") +
+  ggtitle(expression(bold("b  ")~italic("Padina")~plain("spp.")))
+  #geom_hline(yintercept = 0, linetype = "dashed", color = "black")
+  #ggtitle(expression(italic("Padina")~plain("spp.")))
+
+print(Pad)
+```
+
+#Ochtodes all individual lines per treatment
+```{r}
+# preds2 <- read.csv('Output_analysis/preds2.csv')
+# mydata <- read.csv('Output/Photo.RNPP.csv')
+# 
+# # Filter "Grac" species in mydata and exclude "Enriched Respiration" 
+# mydatagrac <- mydata[mydata$Species == "Grac" & mydata$Condition != "RespirationNutrient", ]
+# 
+# # Filter "Grac" species in preds2 and exclude "Enriched Respiration"
+# preds2grac <- preds2[preds2$Species == "Grac" & preds2$Condition != "RespirationNutrient", ]
+# 
+# # Create the ggplot with the filtered data
+# Grac_all <- ggplot(data = mydatagrac) +
+#   geom_point(aes(K - 273.15, log.rate, col = Condition), size = 2) +
+#   geom_line(aes(K - 273.15, ln.rate, col = Condition, group = individual.ID), alpha = 0.5, data = preds2grac) +
+#   scale_color_manual(values = c("RespirationAmbient" = "deepskyblue1", "Net PhotosynthesisAmbient" = "seagreen2", "Net PhotosynthesisNutrient" = "seagreen")) +
+#   theme_bw(base_size = 12, base_family = 'Helvetica') +
+#   ylab(expression(plain("Rate (log " * mu * "mol " * g^-1 * hr^-1 * ")"))) +   # Empty string for y-axis label
+#   xlab('') +
+#   facet_grid(~ Species, scales = "free_y") +
+#   theme(strip.text.x = element_blank(),
+#         strip.background = element_blank()) +  # Remove facet labels
+#   theme(legend.position = "none",
+#         axis.text.x = element_text(face = "plain", color = "black", size = 19), 
+#         axis.text.y = element_text(face = "plain", color = "black", size = 19),
+#         axis.title.x = element_text(color = "black", size = 25, face = "plain"),
+#         axis.title.y = element_text(color = "black", size = 22, face = "plain"),
+#         panel.grid.major = element_blank(),
+#         panel.grid.minor = element_blank(),
+#         panel.border = element_blank(),  # Remove border
+#         axis.line = element_line(color = "black"),  # Adjust axis line if needed
+#         axis.ticks = element_line(color = "black"),
+#         plot.title = element_text(size = 24)) +   # Adjust axis ticks if needed
+#   labs(col = "Treatment") +
+#   ggtitle(expression(italic("Ochtodes")~plain("spp."))) # Set title in italics
+# 
+# # Display the filtered plot
+# print(Grac_all)
+
+```
+
+#Ochtodes mean lines per treatment
+```{r}
+preds2 <- read.csv('Output_analysis/preds2.csv')
+mydata <- read.csv('Output/Photo.RNPP.csv')
+
+library(ggplot2)
+
+# Filter "Pad" species in mydata and exclude "Enriched Respiration"
+mydatagrac <- mydata[mydata$Species == "Grac" & mydata$Condition != "RespirationNutrient", ]
+
+# Filter "Pad" species in preds2 and exclude "Enriched Respiration"
+preds2grac <- preds2[preds2$Species == "Grac" & preds2$Condition != "RespirationNutrient", ]
+
+
+# Calculate mean values for each condition
+mean_data <- aggregate(log.rate ~ Condition + K, data = mydatagrac, FUN = mean)
+
+# Create the ggplot with the filtered data and mean lines
+Grac <- ggplot(data = mydatagrac) +
+  geom_point(aes(K - 273.15, log.rate, col = Condition), size = 2) +
+  geom_smooth(aes(K - 273.15, ln.rate, col = Condition, fill = Condition), method = "loess", se = TRUE, size = 0.25, span = 0.04, alpha = 0.28, data = preds2grac) +
+  scale_color_manual(values = c("RespirationAmbient" = "deepskyblue1", "Net PhotosynthesisAmbient" = "seagreen2", "Net PhotosynthesisNutrient" = "seagreen"),
+                     guide = "none") +
+  scale_fill_manual(values = c("RespirationAmbient" = "deepskyblue1", "Net PhotosynthesisAmbient" = "seagreen2", "Net PhotosynthesisNutrient" = "seagreen")) +
+  theme_bw(base_size = 12, base_family = 'Helvetica') +
+  ylab(expression(plain("Rate (log " * mu * "mol " * g^-1 * hr^-1 * ")"))) +   # Empty string for y-axis label
+  xlab('') +
+  facet_grid(~ Species, scales = "free_y") +
+  theme(strip.text.x = element_blank(),
+        strip.background = element_blank(),
+        legend.position = "none",
+        axis.text.x = element_text(face = "plain", color = "black", size = 18), 
+        axis.text.y = element_text(face = "plain", color = "black", size = 18),
+        axis.title.x = element_text(color = "black", size = 23, face = "plain"),
+        axis.title.y = element_text(color = "black", size = 23, face = "plain"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.ticks = element_line(color = "black"),
+        plot.title = element_text(size = 22, face = "bold", hjust = -.15)) +
+  scale_y_continuous(limits = c(-0.96, 7), breaks = seq(0, 7, by = 1)) +
+  labs(col = "Treatment") +
+  ggtitle(expression(bold("a  ")~italic("Ochtodes")~plain("spp.")))
+  #geom_hline(yintercept = 0, linetype = "dashed", color = "black")
+  #ggtitle(expression(italic("Ochtodes")~plain("spp."))) # Set title in italics
+
+print(Grac)
+```
+
+#Caulerpa all individual lines per treatment
+```{r}
+# preds2 <- read.csv('Output_analysis/preds2.csv')
+# mydata <- read.csv('Output/Photo.RNPP.csv')
+# 
+# # Filter "Caul" species in mydata and exclude "Enriched Respiration"
+# mydatacaul <- mydata[mydata$Species == "Caul" & mydata$Condition != "RespirationNutrient", ]
+# 
+# # Filter "Caul" species in preds2 and exclude "Enriched Respiration"
+# preds2caul <- preds2[preds2$Species == "Caul" & preds2$Condition != "RespirationNutrient", ]
+# 
+# # Create the ggplot with the filtered data
+# Caul_all <- ggplot(data = mydatacaul) +
+#   geom_point(aes(K - 273.15, log.rate, col = Condition), size = 2) +
+#   geom_line(aes(K - 273.15, ln.rate, col = Condition, group = individual.ID), alpha = 0.5, data = preds2caul) +
+#   scale_color_manual(values = c("RespirationAmbient" = "deepskyblue1", "Net PhotosynthesisAmbient" = "seagreen2", "Net PhotosynthesisNutrient" = "seagreen")) +
+#   theme_bw(base_size = 12, base_family = 'Helvetica') +
+#   xlab('Temperature (ºC)') +  # Empty string for x-axis label
+#   ylab(expression(plain("Rate (log " * mu * "mol " * g^-1 * hr^-1 * ")"))) + 
+#   facet_grid(~ Species, scales = "free_y") +
+#   theme(strip.text.x = element_blank(),
+#         strip.background = element_blank()) +
+#   theme(legend.position = "none",
+#         axis.text.x = element_text(face = "plain", color = "black", size = 19), 
+#         axis.text.y = element_text(face = "plain", color = "black", size = 19),
+#         axis.title.x = element_text(color = "black", size = 25, face = "plain"),
+#         axis.title.y = element_text(color = "black", size = 22, face = "plain"),
+#         panel.grid.major = element_blank(),
+#         panel.grid.minor = element_blank(),
+#         panel.border = element_blank(),
+#         axis.line = element_line(color = "black"),
+#         axis.ticks = element_line(color = "black"),
+#         plot.title = element_text(size = 24)) +   # Adjust axis ticks if needed
+#   labs(col = "Treatment") +
+#   ggtitle(expression(italic("Caulerpa racemosa")))  # Set title in italics
+# 
+# # Display the filtered plot
+# print(Caul_all)
+
+```
+
+#Caulerpa mean lines per treatment
+```{r}
+preds2 <- read.csv('Output_analysis/preds2.csv')
+mydata <- read.csv('Output/Photo.RNPP.csv')
+
+library(ggplot2)
+
+# Filter "Pad" species in mydata and exclude "Enriched Respiration"
+mydatacaul <- mydata[mydata$Species == "Caul" & mydata$Condition != "RespirationNutrient", ]
+
+# Filter "Pad" species in preds2 and exclude "Enriched Respiration"
+preds2caul <- preds2[preds2$Species == "Caul" & preds2$Condition != "RespirationNutrient", ]
+
+
+# Calculate mean values for each condition
+mean_data <- aggregate(log.rate ~ Condition + K, data = mydatacaul, FUN = mean)
+
+# Create the ggplot with the filtered data and mean lines
+Caul <- ggplot(data = mydatacaul) +
+  geom_point(aes(K - 273.15, log.rate, col = Condition), size = 2) +
+  geom_smooth(aes(K - 273.15, ln.rate, col = Condition, fill = Condition), method = "loess", se = TRUE, size = 0.25, span = 0.04, alpha = 0.28, data = preds2caul) +
+  scale_color_manual(values = c("RespirationAmbient" = "deepskyblue1", "Net PhotosynthesisAmbient" = "seagreen2", "Net PhotosynthesisNutrient" = "seagreen"),
+                     guide = "none") +
+  scale_fill_manual(values = c("RespirationAmbient" = "deepskyblue1", "Net PhotosynthesisAmbient" = "seagreen2", "Net PhotosynthesisNutrient" = "seagreen")) +
+  theme_bw(base_size = 12, base_family = 'Helvetica') +
+  xlab('Temperature (ºC)') +
+  ylab(expression(plain("Rate (log " * mu * "mol " * g^-1 * hr^-1 * ")"))) +
+  facet_grid(~ Species, scales = "free_y") +
+  theme(strip.text.x = element_blank(),
+        strip.background = element_blank(),
+        legend.position = "none",
+        axis.text.x = element_text(face = "plain", color = "black", size = 18), 
+        axis.text.y = element_text(face = "plain", color = "black", size = 18),
+        axis.title.x = element_text(color = "black", size = 23, face = "plain"),
+        axis.title.y = element_text(color = "black", size = 23, face = "plain"),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        axis.line = element_line(color = "black"),
+        axis.ticks = element_line(color = "black"),
+        plot.title = element_text(size = 22, face = "bold", hjust = -.3)) +
+  scale_y_continuous(limits = c(-0.75, 7.065), breaks = seq(0, 7, by = 1)) +
+  labs(col = "Treatment") +
+  ggtitle(expression(bold("c  ")~italic("Caulerpa racemosa")))
+  #geom_hline(yintercept = 0, linetype = "dashed", color = "black")
+  #ggtitle(expression(italic("Caulerpa racemosa")))
+
+print(Caul)
+
+```
+
+#Arrange the mean plots into a 2x2 panel grid
+```{r}
+#install.packages("gridExtra")
+library(gridExtra)
+
+grid <- grid.arrange(Grac, Pad, Caul, Ulv, ncol = 2)
+
+grid
+```
+
+#Arrange the all individuals plots into a 2x2 panel grid
+```{r}
+#install.packages("gridExtra")
+# library(gridExtra)
+# 
+# grid_all <- grid.arrange(Grac_all, Pad_all, Caul_all, Ulv_all, ncol = 2)
+# 
+# grid_all
+```
+
+
+#######Parameter model selection and statistical analysis######
+
+#Topt parameter NP model
+```{r}
+library(lme4)
+Topt_data_NP<-read.csv('Output_analysis/Topt.csv')
+
+# Fit the GLM model
+glm <- glm(Topt ~ Ambient_Nutrient * Species, data = Topt_data_NP, subset = rate.type == "Net Photosynthesis", family = gaussian(link = "identity"))
+
+# Fit the linear model
+lm <- lm(Topt ~ Ambient_Nutrient * Species, data = Topt_data_NP, subset = rate.type == "Net Photosynthesis")
+
+# Compare AIC and BIC values
+AIC(glm, lm)
+
+BIC(glm, lm)
+
+
+# Check the class of the Species variable
+class(Topt_data_NP$Species)
+
+# If it's not a factor, convert it to a factor
+Topt_data_NP$Species <- factor(Topt_data_NP$Species)
+
+# Relevel the Species variable
+Topt_data_NP$Species <- relevel(Topt_data_NP$Species, ref = "Pad")
+
+# Fit the linear model
+ Topt.NP <- lm(Topt ~ Ambient_Nutrient * Species, data = Topt_data_NP, subset = rate.type == "Net Photosynthesis")
+ 
+# Create the aov object
+ Topt.NP.aov <- aov(Topt ~ Ambient_Nutrient * Species, data = Topt_data_NP, subset = rate.type == "Net Photosynthesis")
+
+# Run the Tukey HSD test on the aov object
+TukeyHSD(Topt.NP.aov)
+
+anova(Topt.NP)
+summary(Topt.NP)
+```
+
+#Pmax parameter NP model
+```{r}
+library(lme4)
+pmax_data_NP<-read.csv('Output_analysis/pmax.csv')
+
+# Fit the GLM model
+glm <- glm(Pmax ~ Ambient_Nutrient * Species, data = pmax_data_NP, subset = rate.type == "Net Photosynthesis", family = gaussian(link = "identity"))
+
+# Fit the linear model
+lm1 <- lm(Pmax ~ Ambient_Nutrient * Species, data = pmax_data_NP, subset = rate.type == "Net Photosynthesis")
+
+# Fit the linear log model
+lm2 <- lm(log(Pmax) ~ Ambient_Nutrient * Species, data = pmax_data_NP, subset = rate.type == "Net Photosynthesis")
+
+# Compare AIC and BIC values
+AIC(glm, lm1, lm2)
+
+BIC(glm, lm1, lm2)
+
+
+# Check the class of the Species variable
+class(pmax_data_NP$Species)
+
+# If it's not a factor, convert it to a factor
+pmax_data_NP$Species <- factor(pmax_data_NP$Species)
+
+# Relevel the Species variable
+pmax_data_NP$Species <- relevel(pmax_data_NP$Species, ref = "Pad")
+
+# Fit the linear model
+Topt.NP <- lm(Pmax ~ Ambient_Nutrient * Species, data = pmax_data_NP, subset = rate.type == "Net Photosynthesis")
+ 
+# Create the aov object
+Topt.NP.aov <- aov(Pmax ~ Ambient_Nutrient * Species, data = pmax_data_NP, subset = rate.type == "Net Photosynthesis")
+
+# Run the Tukey HSD test on the aov object
+TukeyHSD(Topt.NP.aov)
+
+anova(Topt.NP)
+summary(Topt.NP)
+```
+
+#E parameter NP model
+```{r}
+library(lme4)
+E_data_NP<-read.csv('Output_analysis/E.csv')
+
+# Fit the GLM model
+glm <- glm(E ~ Ambient_Nutrient * Species, data = E_data_NP, subset = rate.type == "Net Photosynthesis", family = gaussian(link = "identity"))
+
+# Fit the linear model
+lm1 <- lm(E ~ Ambient_Nutrient * Species, data = E_data_NP, subset = rate.type == "Net Photosynthesis")
+
+# Fit the linear log model
+lmlog <- lm(log(E) ~ Ambient_Nutrient * Species, data = E_data_NP, subset = rate.type == "Net Photosynthesis")
+
+# Compare AIC and BIC values
+AIC(glm, lm1 , lmlog)
+
+BIC(glm, lm1 , lmlog)
+
+
+# Check the class of the Species variable
+class(E_data_NP$Species)
+
+# If it's not a factor, convert it to a factor
+E_data_NP$Species <- factor(E_data_NP$Species)
+
+# Relevel the Species variable
+E_data_NP$Species <- relevel(E_data_NP$Species, ref = "Pad")
+
+# Fit the linear model
+ Topt.NP <- lm(log(E) ~ Ambient_Nutrient * Species, data = E_data_NP, subset = rate.type == "Net Photosynthesis")
+ 
+# Create the aov object
+ Topt.NP.aov <- aov(log(E) ~ Ambient_Nutrient * Species, data = E_data_NP, subset = rate.type == "Net Photosynthesis")
+
+# Run the Tukey HSD test on the aov object
+TukeyHSD(Topt.NP.aov)
+
+anova(Topt.NP)
+summary(Topt.NP)
+```
+
+#Eh parameter NP model
+```{r}
+library(lme4)
+Eh_data_NP<-read.csv('Output_analysis/Eh.csv')
+
+# Filter the data
+Topt_data_filtered <- Topt_data_NP %>%
+  filter(rate.type == "Net Photosynthesis" & Ambient_Nutrient %in% c("Ambient", "Enriched"))
+
+# Fit the GLM model
+glm <- glm(Eh ~ Ambient_Nutrient * Species, data = Eh_data_NP, subset = rate.type == "Net Photosynthesis", family = gaussian(link = "identity"))
+
+# Fit the linear model
+lm1 <- lm(Eh ~ Ambient_Nutrient * Species, data = Eh_data_NP, subset = rate.type == "Net Photosynthesis")
+
+# Fit the linear log model
+lmlog <- lm(log(Eh) ~ Ambient_Nutrient * Species, data = Eh_data_NP, subset = rate.type == "Net Photosynthesis")
+
+# Compare AIC and BIC values
+AIC(glm, lm1, lmlog)
+
+BIC(glm, lm1, lmlog)
+
+
+
+# Check the class of the Species variable
+class(Eh_data_NP$Species)
+
+# If it's not a factor, convert it to a factor
+Eh_data_NP$Species <- factor(Eh_data_NP$Species)
+
+# Relevel the Species variable
+Eh_data_NP$Species <- relevel(Eh_data_NP$Species, ref = "Pad")
+
+# Fit the linear model
+ Topt.NP <- lm(log(Eh) ~ Ambient_Nutrient * Species, data = Eh_data_NP, subset = rate.type == "Net Photosynthesis")
+# Create the aov object
+ Topt.NP.aov <- aov(log(Eh) ~ Ambient_Nutrient * Species, data = Eh_data_NP, subset = rate.type == "Net Photosynthesis")
+
+# Run the Tukey HSD test on the aov object
+TukeyHSD(Topt.NP.aov)
+
+anova(Topt.NP)
+summary(Topt.NP)
+```
+
