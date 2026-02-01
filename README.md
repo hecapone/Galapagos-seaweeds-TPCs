@@ -1,6 +1,6 @@
 # Nutrient enrichment can increase the thermal performance of Galápagos seaweeds
 
-This code repository contains all data and analysis for the associated manuscript
+This code repository contains all data and analysis for the associated manuscript (https://www.int-res.com/abstracts/meps/v749/meps14727)
 
 **Authors:** Haley E. Capone*, Margarita Brandt, Paul W. Gabrielson, John F. Bruno
 
